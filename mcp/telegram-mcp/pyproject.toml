@@ -34,9 +34,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/thClaws/marketplace/tree/main/mcp/telegram-mcp"
-Repository = "https://github.com/thClaws/marketplace"
-Issues = "https://github.com/thClaws/marketplace/issues"
+Homepage = "https://github.com/kaebmoo/thclaws-marketplace/tree/feat/telegram-mcp/mcp/telegram-mcp"
+Repository = "https://github.com/kaebmoo/thclaws-marketplace"
+Issues = "https://github.com/kaebmoo/thclaws-marketplace/issues"
 
 [project.scripts]
 thclaws-telegram = "telegram_mcp.server:main"
