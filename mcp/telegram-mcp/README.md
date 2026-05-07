@@ -140,10 +140,11 @@ printf '%s\n' \
 To send a real Telegram message without thClaws, replace `123456789` with an allowlisted chat ID:
 
 ```bash
-printf '%s\n' \
+{ printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"manual-smoke","version":"0.1.0"}}}' \
   '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"telegram_send_message","arguments":{"chat_id":"123456789","text":"Telegram MCP smoke test"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"telegram_send_message","arguments":{"chat_id":"123456789","text":"Telegram MCP smoke test"}}}'; \
+  sleep 5; } \
 | ./.venv/bin/python -m telegram_mcp
 ```
 
