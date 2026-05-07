@@ -9,14 +9,19 @@ import json
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 from telegram_mcp.server import (
     TelegramApiError,
     TelegramConfigError,
     _api_url,
+    _chat_id_from_update,
     _check_chat_allowed,
+    _compact_update,
+    _telegram_response,
     _telegram_result,
+    main,
     telegram_get_updates,
     telegram_send_document,
     telegram_send_message,
@@ -91,6 +96,19 @@ async def test_send_message_builds_telegram_request() -> None:
 
 
 @pytest.mark.asyncio
+async def test_telegram_http_error_body_is_preserved() -> None:
+    request = httpx.Request("POST", "https://api.telegram.org/bottest/sendMessage")
+    response = httpx.Response(
+        400,
+        json={"ok": False, "error_code": 400, "description": "chat not found"},
+        request=request,
+    )
+
+    with pytest.raises(TelegramApiError, match="chat not found"):
+        await _telegram_response(response, "sendMessage")
+
+
+@pytest.mark.asyncio
 async def test_get_updates_filters_to_allowed_chats() -> None:
     fake_post = AsyncMock(
         return_value=_fake_response(
@@ -135,6 +153,23 @@ async def test_get_updates_filters_to_allowed_chats() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_updates_webhook_conflict_has_hint() -> None:
+    request = httpx.Request("POST", "https://api.telegram.org/bottest/getUpdates")
+    response = httpx.Response(
+        409,
+        json={
+            "ok": False,
+            "error_code": 409,
+            "description": "Conflict: can't use getUpdates method while webhook is active",
+        },
+        request=request,
+    )
+
+    with pytest.raises(TelegramApiError, match="deleteWebhook"):
+        await _telegram_response(response, "getUpdates")
+
+
+@pytest.mark.asyncio
 async def test_file_upload_rejects_missing_file() -> None:
     with pytest.raises(TelegramConfigError, match="does not exist"):
         await telegram_send_photo("123", "/tmp/not-a-real-telegram-file.png")
@@ -147,9 +182,41 @@ async def test_file_upload_rejects_url() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_document_uploads_local_file(tmp_path: Path) -> None:
+async def test_file_upload_rejects_path_outside_allowed_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allowed = tmp_path / "allowed"
+    outside = tmp_path / "outside"
+    allowed.mkdir()
+    outside.mkdir()
+    doc = outside / "secret.txt"
+    doc.write_text("secret", encoding="utf-8")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_FILE_ROOTS", str(allowed))
+
+    with pytest.raises(TelegramConfigError, match="outside TELEGRAM_ALLOWED_FILE_ROOTS"):
+        await telegram_send_document("123", str(doc))
+
+
+@pytest.mark.asyncio
+async def test_file_upload_rejects_oversized_document(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     doc = tmp_path / "report.txt"
     doc.write_text("hello", encoding="utf-8")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_FILE_ROOTS", str(tmp_path))
+    monkeypatch.setattr("telegram_mcp.server.MAX_DOCUMENT_BYTES", 3)
+
+    with pytest.raises(TelegramConfigError, match="too large"):
+        await telegram_send_document("123", str(doc))
+
+
+@pytest.mark.asyncio
+async def test_send_document_uploads_local_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    doc = tmp_path / "report.txt"
+    doc.write_text("hello", encoding="utf-8")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_FILE_ROOTS", str(tmp_path))
     fake_post = AsyncMock(
         return_value=_fake_response(
             {
@@ -173,9 +240,66 @@ async def test_send_document_uploads_local_file(tmp_path: Path) -> None:
     assert "document" in kwargs["files"]
 
 
+@pytest.mark.asyncio
+async def test_send_message_rejects_invalid_parse_mode() -> None:
+    with pytest.raises(TelegramConfigError, match="parse_mode"):
+        await telegram_send_message("123", "hello", parse_mode="NotAMode")
+
+
+@pytest.mark.asyncio
+async def test_send_message_rejects_too_long_text() -> None:
+    with pytest.raises(TelegramConfigError, match="4096"):
+        await telegram_send_message("123", "x" * 4097)
+
+
 def test_telegram_api_error_surfaces() -> None:
     with pytest.raises(TelegramApiError, match=r"\[400\] Bad Request"):
         _telegram_result(
             {"ok": False, "error_code": 400, "description": "Bad Request"},
             "sendMessage",
         )
+
+
+def test_update_chat_id_supports_membership_updates() -> None:
+    update = {
+        "update_id": 100,
+        "chat_join_request": {
+            "chat": {"id": -456, "type": "supergroup"},
+            "from": {"username": "reviewer"},
+        },
+    }
+
+    assert _chat_id_from_update(update) == "-456"
+    compact = _compact_update(update)
+    assert compact["kind"] == "chat_join_request"
+    assert compact["chat_id"] == -456
+
+
+def test_compact_update_callback_query_branch() -> None:
+    compact = _compact_update(
+        {
+            "update_id": 101,
+            "callback_query": {
+                "id": "cb-1",
+                "from": {"username": "alice"},
+                "data": "approve",
+            },
+        }
+    )
+
+    assert compact["kind"] == "callback_query"
+    assert compact["callback_query_id"] == "cb-1"
+    assert compact["data"] == "approve"
+
+
+def test_sse_transport_binds_localhost_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MCP_TRANSPORT", "sse")
+    monkeypatch.delenv("MCP_HOST", raising=False)
+
+    with patch("telegram_mcp.server.mcp.run") as run:
+        main()
+
+    run.assert_called_once_with(transport="sse")
+    from telegram_mcp.server import mcp
+
+    assert mcp.settings.host == "127.0.0.1"

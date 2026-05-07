@@ -16,6 +16,10 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 
 DEFAULT_API_BASE = "https://api.telegram.org"
+MAX_MESSAGE_CHARS = 4096
+MAX_PHOTO_BYTES = 10 * 1024 * 1024
+MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
+PARSE_MODES = {"MarkdownV2", "HTML", "Markdown"}
 
 
 class TelegramConfigError(RuntimeError):
@@ -68,24 +72,82 @@ def _api_url(method: str) -> str:
     return f"{_api_base()}/bot{_token()}/{method}"
 
 
-def _telegram_result(data: dict[str, Any], method: str) -> dict[str, Any]:
+def _telegram_result(data: dict[str, Any], method: str) -> Any:
     if data.get("ok") is not True:
         description = data.get("description") or "unknown Telegram API error"
         error_code = data.get("error_code")
+        if method == "getUpdates" and error_code == 409:
+            description = (
+                f"{description}. Telegram returned a conflict while polling "
+                "updates; if this bot has a webhook configured, call "
+                "deleteWebhook before using telegram_get_updates."
+            )
         if error_code is None:
             raise TelegramApiError(f"{method}: {description}")
         raise TelegramApiError(f"{method}: [{error_code}] {description}")
-    result = data.get("result")
-    if isinstance(result, dict):
+    return data.get("result")
+
+
+async def _telegram_response(resp: httpx.Response, method: str) -> Any:
+    """Parse Telegram JSON before raising HTTP status errors.
+
+    Telegram returns useful API errors such as "chat not found" inside a
+    JSON body that may arrive with HTTP 400/403. If we call
+    raise_for_status() first, that description is lost.
+    """
+    try:
+        data = resp.json()
+    except ValueError:
+        resp.raise_for_status()
+        raise TelegramApiError(f"{method}: response was not valid JSON")
+    if isinstance(data, dict):
+        result = _telegram_result(data, method)
+        resp.raise_for_status()
         return result
-    return {"result": result}
+    resp.raise_for_status()
+    raise TelegramApiError(f"{method}: response JSON was not an object")
 
 
-async def _post_json(method: str, payload: dict[str, Any]) -> dict[str, Any]:
+async def _post_json(method: str, payload: dict[str, Any]) -> Any:
     async with httpx.AsyncClient() as client:
         resp = await client.post(_api_url(method), json=payload, timeout=20.0)
-    resp.raise_for_status()
-    return _telegram_result(resp.json(), method)
+    return await _telegram_response(resp, method)
+
+
+def _allowed_file_roots() -> list[Path]:
+    raw = os.environ.get("TELEGRAM_ALLOWED_FILE_ROOTS", "")
+    roots: list[Path] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        root = Path(item).expanduser().resolve()
+        if not root.is_dir():
+            raise TelegramConfigError(
+                f"TELEGRAM_ALLOWED_FILE_ROOTS entry is not a directory: {item}"
+            )
+        roots.append(root)
+    if not roots:
+        raise TelegramConfigError(
+            "TELEGRAM_ALLOWED_FILE_ROOTS is required for file uploads; "
+            "set a comma-separated list of directories the agent may send from"
+        )
+    return roots
+
+
+def _resolve_allowed_file(file_path: str) -> Path:
+    if str(file_path).startswith(("http://", "https://")):
+        raise TelegramConfigError("file_path must be a local path, not a URL")
+    path = Path(file_path).expanduser()
+    if not path.exists() or not path.is_file():
+        raise TelegramConfigError(f"file_path does not exist or is not a file: {file_path}")
+    resolved = path.resolve()
+    for root in _allowed_file_roots():
+        if resolved == root or root in resolved.parents:
+            return resolved
+    raise TelegramConfigError(
+        f"file_path is outside TELEGRAM_ALLOWED_FILE_ROOTS: {file_path}"
+    )
 
 
 async def _post_file(
@@ -94,12 +156,15 @@ async def _post_file(
     chat_id: str,
     file_path: str,
     caption: str | None,
-) -> dict[str, Any]:
-    path = Path(file_path).expanduser()
-    if str(file_path).startswith(("http://", "https://")):
-        raise TelegramConfigError("file_path must be a local path, not a URL")
-    if not path.is_file():
-        raise TelegramConfigError(f"file_path does not exist or is not a file: {file_path}")
+    max_bytes: int,
+) -> Any:
+    path = _resolve_allowed_file(file_path)
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise TelegramConfigError(
+            f"file_path is too large for {method}: {size} bytes "
+            f"(max {max_bytes} bytes)"
+        )
 
     data: dict[str, str] = {"chat_id": chat_id}
     if caption:
@@ -114,8 +179,26 @@ async def _post_file(
                 files=files,
                 timeout=60.0,
             )
-    resp.raise_for_status()
-    return _telegram_result(resp.json(), method)
+    return await _telegram_response(resp, method)
+
+
+def _validate_message_text(text: str) -> str:
+    if not text:
+        raise TelegramConfigError("text is required")
+    if len(text) > MAX_MESSAGE_CHARS:
+        raise TelegramConfigError(
+            f"text exceeds Telegram's {MAX_MESSAGE_CHARS}-character message limit"
+        )
+    return text
+
+
+def _validate_parse_mode(parse_mode: str | None) -> str | None:
+    if parse_mode is None or parse_mode == "":
+        return None
+    if parse_mode not in PARSE_MODES:
+        allowed = ", ".join(sorted(PARSE_MODES))
+        raise TelegramConfigError(f"parse_mode must be one of: {allowed}")
+    return parse_mode
 
 
 def _message_summary(result: dict[str, Any]) -> str:
@@ -136,6 +219,12 @@ def _chat_id_from_update(update: dict[str, Any]) -> str | None:
         msg = update.get(key)
         if isinstance(msg, dict):
             chat = msg.get("chat")
+            if isinstance(chat, dict) and chat.get("id") is not None:
+                return str(chat["id"])
+    for key in ("my_chat_member", "chat_member", "chat_join_request"):
+        item = update.get(key)
+        if isinstance(item, dict):
+            chat = item.get("chat")
             if isinstance(chat, dict) and chat.get("id") is not None:
                 return str(chat["id"])
     callback = update.get("callback_query")
@@ -165,6 +254,22 @@ def _compact_update(update: dict[str, Any]) -> dict[str, Any]:
                 "chat_type": chat.get("type"),
                 "from_username": sender.get("username"),
                 "text": msg.get("text") or msg.get("caption"),
+            }
+        )
+        return compact
+
+    for key in ("my_chat_member", "chat_member", "chat_join_request"):
+        item = update.get(key)
+        if not isinstance(item, dict):
+            continue
+        chat = item.get("chat") if isinstance(item.get("chat"), dict) else {}
+        sender = item.get("from") if isinstance(item.get("from"), dict) else {}
+        compact.update(
+            {
+                "kind": key,
+                "chat_id": chat.get("id"),
+                "chat_type": chat.get("type"),
+                "from_username": sender.get("username"),
             }
         )
         return compact
@@ -208,10 +313,16 @@ async def telegram_send_message(
         parse_mode: Optional Telegram parse mode, e.g. "MarkdownV2" or "HTML".
     """
     allowed_chat_id = _check_chat_allowed(chat_id)
-    payload: dict[str, Any] = {"chat_id": allowed_chat_id, "text": text}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
+    payload: dict[str, Any] = {
+        "chat_id": allowed_chat_id,
+        "text": _validate_message_text(text),
+    }
+    validated_parse_mode = _validate_parse_mode(parse_mode)
+    if validated_parse_mode:
+        payload["parse_mode"] = validated_parse_mode
     result = await _post_json("sendMessage", payload)
+    if not isinstance(result, dict):
+        raise TelegramApiError("sendMessage: result was not an object")
     return f"Telegram message sent: {_message_summary(result)}"
 
 
@@ -229,7 +340,16 @@ async def telegram_send_photo(
         caption: Optional caption.
     """
     allowed_chat_id = _check_chat_allowed(chat_id)
-    result = await _post_file("sendPhoto", "photo", allowed_chat_id, file_path, caption)
+    result = await _post_file(
+        "sendPhoto",
+        "photo",
+        allowed_chat_id,
+        file_path,
+        caption,
+        MAX_PHOTO_BYTES,
+    )
+    if not isinstance(result, dict):
+        raise TelegramApiError("sendPhoto: result was not an object")
     return f"Telegram photo sent: {_message_summary(result)}"
 
 
@@ -253,7 +373,10 @@ async def telegram_send_document(
         allowed_chat_id,
         file_path,
         caption,
+        MAX_DOCUMENT_BYTES,
     )
+    if not isinstance(result, dict):
+        raise TelegramApiError("sendDocument: result was not an object")
     return f"Telegram document sent: {_message_summary(result)}"
 
 
@@ -271,8 +394,7 @@ async def telegram_get_updates(limit: int = 10, offset: int | None = None) -> st
     if offset is not None:
         payload["offset"] = int(offset)
 
-    result = await _post_json("getUpdates", payload)
-    updates = result.get("result") if "result" in result else result
+    updates = await _post_json("getUpdates", payload)
     if not isinstance(updates, list):
         updates = []
 
@@ -293,7 +415,7 @@ def main() -> None:
     transport = os.environ.get("MCP_TRANSPORT", "stdio")
     if transport == "sse":
         port = int(os.environ.get("MCP_PORT", "8000"))
-        mcp.settings.host = "0.0.0.0"
+        mcp.settings.host = os.environ.get("MCP_HOST", "127.0.0.1")
         mcp.settings.port = port
         mcp.run(transport="sse")
     else:
