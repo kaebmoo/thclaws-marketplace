@@ -70,6 +70,28 @@ You can also run it with Python directly:
 | `MCP_HOST` | Host bind address for SSE transport | `127.0.0.1` |
 | `MCP_PORT` | Port for SSE transport | `8000` |
 
+## Transport and Ports
+
+By default this server uses MCP over stdio:
+
+```text
+MCP_TRANSPORT=stdio
+```
+
+In stdio mode it does not open a network port. thClaws starts the process and communicates over stdin/stdout.
+
+Only SSE mode opens a port:
+
+```bash
+MCP_TRANSPORT=sse MCP_HOST=127.0.0.1 MCP_PORT=8000 thclaws-telegram
+```
+
+The default SSE endpoint is:
+
+```text
+http://127.0.0.1:8000/sse
+```
+
 ### Local `.env`
 
 The server reads configuration from process environment variables. It does not parse `.env` files by itself.
@@ -91,6 +113,41 @@ thclaws-telegram
 ```
 
 Do not put `.env` under `src/telegram_mcp/`, and do not commit it.
+
+## Test Without thClaws
+
+You can smoke-test the MCP server directly from this package directory.
+
+First export your local environment:
+
+```bash
+cd mcp/telegram-mcp
+set -a
+source .env
+set +a
+```
+
+Then list tools over stdio:
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"manual-smoke","version":"0.1.0"}}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+| ./.venv/bin/python -m telegram_mcp
+```
+
+To send a real Telegram message without thClaws, replace `123456789` with an allowlisted chat ID:
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"manual-smoke","version":"0.1.0"}}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"telegram_send_message","arguments":{"chat_id":"123456789","text":"Telegram MCP smoke test"}}}' \
+| ./.venv/bin/python -m telegram_mcp
+```
+
+Running `./.venv/bin/python -m telegram_mcp` by itself is also valid, but it will wait silently for MCP JSON-RPC messages on stdin.
 
 ## Finding Your Chat ID
 
