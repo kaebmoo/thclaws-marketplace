@@ -70,6 +70,28 @@ You can also run it with Python directly:
 | `MCP_HOST` | Host bind address for SSE transport | `127.0.0.1` |
 | `MCP_PORT` | Port for SSE transport | `8000` |
 
+### Local `.env`
+
+The server reads configuration from process environment variables. It does not parse `.env` files by itself.
+
+For local development, keep a private `.env` at the package root:
+
+```text
+mcp/telegram-mcp/.env
+```
+
+Use [.env.example](./.env.example) as the template, then export it before running the server:
+
+```bash
+cd mcp/telegram-mcp
+set -a
+source .env
+set +a
+thclaws-telegram
+```
+
+Do not put `.env` under `src/telegram_mcp/`, and do not commit it.
+
 ## Finding Your Chat ID
 
 1. Create a bot with Telegram BotFather and copy its token.
