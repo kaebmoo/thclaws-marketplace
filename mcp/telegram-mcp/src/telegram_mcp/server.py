@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -20,6 +21,7 @@ MAX_MESSAGE_CHARS = 4096
 MAX_PHOTO_BYTES = 10 * 1024 * 1024
 MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
 PARSE_MODES = {"MarkdownV2", "HTML", "Markdown"}
+_ALLOWED_FILE_ROOTS_CACHE: tuple[str, tuple[Path, ...]] | None = None
 
 
 class TelegramConfigError(RuntimeError):
@@ -114,8 +116,12 @@ async def _post_json(method: str, payload: dict[str, Any]) -> Any:
     return await _telegram_response(resp, method)
 
 
-def _allowed_file_roots() -> list[Path]:
+def _allowed_file_roots() -> tuple[Path, ...]:
+    global _ALLOWED_FILE_ROOTS_CACHE
     raw = os.environ.get("TELEGRAM_ALLOWED_FILE_ROOTS", "")
+    if _ALLOWED_FILE_ROOTS_CACHE and _ALLOWED_FILE_ROOTS_CACHE[0] == raw:
+        return _ALLOWED_FILE_ROOTS_CACHE[1]
+
     roots: list[Path] = []
     for item in raw.split(","):
         item = item.strip()
@@ -132,22 +138,51 @@ def _allowed_file_roots() -> list[Path]:
             "TELEGRAM_ALLOWED_FILE_ROOTS is required for file uploads; "
             "set a comma-separated list of directories the agent may send from"
         )
-    return roots
+    _ALLOWED_FILE_ROOTS_CACHE = (raw, tuple(roots))
+    return _ALLOWED_FILE_ROOTS_CACHE[1]
 
 
 def _resolve_allowed_file(file_path: str) -> Path:
     if str(file_path).startswith(("http://", "https://")):
         raise TelegramConfigError("file_path must be a local path, not a URL")
-    path = Path(file_path).expanduser()
-    if not path.exists() or not path.is_file():
+    try:
+        resolved = Path(file_path).expanduser().resolve(strict=True)
+    except FileNotFoundError as exc:
         raise TelegramConfigError(f"file_path does not exist or is not a file: {file_path}")
-    resolved = path.resolve()
+    except OSError as exc:
+        raise TelegramConfigError(f"file_path cannot be resolved: {file_path}: {exc}") from exc
+    if not resolved.is_file():
+        raise TelegramConfigError(f"file_path does not exist or is not a file: {file_path}")
     for root in _allowed_file_roots():
         if resolved == root or root in resolved.parents:
             return resolved
     raise TelegramConfigError(
         f"file_path is outside TELEGRAM_ALLOWED_FILE_ROOTS: {file_path}"
     )
+
+
+def _open_allowed_file(file_path: str, max_bytes: int) -> tuple[Path, BinaryIO]:
+    path = _resolve_allowed_file(file_path)
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise TelegramConfigError(f"file_path cannot be opened safely: {file_path}: {exc}") from exc
+
+    try:
+        opened_stat = os.fstat(fd)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            raise TelegramConfigError(f"file_path is not a regular file: {file_path}")
+        if opened_stat.st_size > max_bytes:
+            raise TelegramConfigError(
+                f"file_path is too large: {opened_stat.st_size} bytes "
+                f"(max {max_bytes} bytes)"
+            )
+        return path, os.fdopen(fd, "rb")
+    except Exception:
+        os.close(fd)
+        raise
 
 
 async def _post_file(
@@ -158,19 +193,13 @@ async def _post_file(
     caption: str | None,
     max_bytes: int,
 ) -> Any:
-    path = _resolve_allowed_file(file_path)
-    size = path.stat().st_size
-    if size > max_bytes:
-        raise TelegramConfigError(
-            f"file_path is too large for {method}: {size} bytes "
-            f"(max {max_bytes} bytes)"
-        )
+    path, handle = _open_allowed_file(file_path, max_bytes)
 
     data: dict[str, str] = {"chat_id": chat_id}
     if caption:
         data["caption"] = caption
 
-    with path.open("rb") as handle:
+    with handle:
         files = {file_field: (path.name, handle)}
         async with httpx.AsyncClient() as client:
             resp = await client.post(

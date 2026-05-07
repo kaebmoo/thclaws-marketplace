@@ -6,6 +6,7 @@ The tests patch httpx so they never call the real Telegram Bot API.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -15,10 +16,12 @@ import pytest
 from telegram_mcp.server import (
     TelegramApiError,
     TelegramConfigError,
+    _allowed_file_roots,
     _api_url,
     _chat_id_from_update,
     _check_chat_allowed,
     _compact_update,
+    _open_allowed_file,
     _telegram_response,
     _telegram_result,
     main,
@@ -62,6 +65,23 @@ def test_missing_allowlist_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TELEGRAM_ALLOWED_CHAT_IDS")
     with pytest.raises(TelegramConfigError, match="TELEGRAM_ALLOWED_CHAT_IDS"):
         _check_chat_allowed("123")
+
+
+def test_allowed_file_roots_cache_tracks_env_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+
+    monkeypatch.setenv("TELEGRAM_ALLOWED_FILE_ROOTS", str(first))
+    assert _allowed_file_roots() == (first.resolve(),)
+    # Same env value returns the cached tuple.
+    assert _allowed_file_roots() == (first.resolve(),)
+
+    monkeypatch.setenv("TELEGRAM_ALLOWED_FILE_ROOTS", str(second))
+    assert _allowed_file_roots() == (second.resolve(),)
 
 
 @pytest.mark.asyncio
@@ -195,6 +215,28 @@ async def test_file_upload_rejects_path_outside_allowed_roots(
 
     with pytest.raises(TelegramConfigError, match="outside TELEGRAM_ALLOWED_FILE_ROOTS"):
         await telegram_send_document("123", str(doc))
+
+
+def test_open_allowed_file_uses_nofollow_when_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    doc = tmp_path / "report.txt"
+    doc.write_text("hello", encoding="utf-8")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_FILE_ROOTS", str(tmp_path))
+    real_open = os.open
+    seen: dict[str, int] = {}
+
+    def recording_open(path: Path, flags: int) -> int:
+        seen["flags"] = flags
+        return real_open(path, flags)
+
+    with patch("telegram_mcp.server.os.open", side_effect=recording_open):
+        _, handle = _open_allowed_file(str(doc), 100)
+        handle.close()
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow:
+        assert seen["flags"] & nofollow
 
 
 @pytest.mark.asyncio
