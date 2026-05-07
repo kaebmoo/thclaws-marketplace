@@ -58,6 +58,51 @@ You can also run it with Python directly:
 }
 ```
 
+## Use With thClaws
+
+For normal thClaws usage, do not run this MCP server manually. Configure it in the project where you want the Telegram tools available, and thClaws will spawn the server process over stdio.
+
+Project-local config:
+
+```text
+<your-project>/.thclaws/mcp.json
+```
+
+Example:
+
+```json
+{
+  "mcpServers": {
+    "telegram": {
+      "command": "/absolute/path/to/thclaws-marketplace/mcp/telegram-mcp/.venv/bin/python",
+      "args": ["-m", "telegram_mcp"],
+      "env": {
+        "TELEGRAM_BOT_TOKEN": "replace-with-your-bot-token",
+        "TELEGRAM_ALLOWED_CHAT_IDS": "123456789",
+        "TELEGRAM_ALLOWED_FILE_ROOTS": "/absolute/path/to/your-project"
+      }
+    }
+  }
+}
+```
+
+Then start thClaws from that project root:
+
+```bash
+cd <your-project>
+thclaws
+```
+
+The server is spawned automatically. You only need to run `python -m telegram_mcp` yourself for local MCP smoke tests or SSE hosting.
+
+If you want the Telegram tools available in every project, put the same config in:
+
+```text
+~/.config/thclaws/mcp.json
+```
+
+Avoid committing project-local MCP config files that contain real bot tokens.
+
 ## Configuration
 
 | Env var | Purpose | Default |
