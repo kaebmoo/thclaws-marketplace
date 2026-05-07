@@ -4,6 +4,32 @@ Telegram Bot API MCP server for thClaws agents. It lets an agent send messages, 
 
 This is a tool surface, not a thClaws UI transport. Use it for notifications, escalation, and sending artifacts after work completes.
 
+## Scope
+
+This MCP server lets thClaws agents contact Telegram. It is useful for:
+
+- notifying a user when work finishes or fails
+- sending build/test/deploy summaries
+- sending generated reports, logs, photos, or documents
+- escalating blockers to an allowlisted chat
+- manually reading recent bot updates with `telegram_get_updates`
+
+It does not make Telegram a live thClaws chat UI. A Telegram user cannot send a message and have thClaws automatically continue the active session unless the agent explicitly calls `telegram_get_updates` or a separate bridge is built.
+
+Current flow:
+
+```text
+thClaws agent -> Telegram MCP tool -> Telegram Bot API -> Telegram chat
+```
+
+Not implemented here:
+
+```text
+Telegram user -> Telegram bot -> thClaws session -> Telegram reply
+```
+
+Keeping this first version as an MCP tool keeps the security surface small and avoids changing thClaws core.
+
 ## Tools
 
 | Tool | Args | Returns |
@@ -242,6 +268,66 @@ Generate the report, then send the PDF to chat 123456789 over Telegram.
 - It does not implement a long-running approval workflow or wait-for-reply tool yet.
 - It does not accept remote file URLs for uploads.
 - It does not manage Telegram webhooks.
+
+## Future Work
+
+### Add Reply-Oriented Tools
+
+The next small step would still fit inside this MCP server:
+
+- `telegram_wait_for_reply(chat_id, prompt, timeout_seconds)`
+- `telegram_ask_user(chat_id, question, timeout_seconds)`
+- `telegram_ack_update(offset)` or helper state for update offsets
+
+These tools would let an agent ask a specific question and wait for a reply without turning Telegram into a full UI. Design points:
+
+- how to persist or pass Telegram `update_id` offsets
+- timeout behavior
+- whether replies must come from a specific user or any allowlisted chat member
+- how to avoid consuming unrelated messages from a busy group
+- how to phrase prompts so users know they are responding to an agent
+
+### Build a Telegram UI Bridge
+
+A full Telegram chat interface should be a separate bridge or a thClaws core feature, not an MCP tool. The bridge would receive Telegram updates continuously and forward user messages into a thClaws session.
+
+Possible architecture:
+
+```text
+Telegram user
+  -> Telegram bot webhook or polling bridge
+  -> thclaws --serve WebSocket /ws
+  -> thClaws SharedSession
+  -> bridge sends assistant output back to Telegram
+```
+
+Key design decisions:
+
+- map `chat_id` to project root and thClaws session
+- decide whether each chat has one persistent session or can create/load sessions
+- authenticate and allowlist users/chats
+- handle groups, mentions, replies, and accidental messages
+- implement cancel/new-session controls
+- handle approval prompts safely
+- chunk long assistant output for Telegram message limits
+- decide how files and images map between Telegram and thClaws
+- manage polling/webhook lifecycle and reconnects
+- prevent prompt injection from untrusted group messages
+- define logs and audit behavior without leaking private chat data
+
+Security cautions:
+
+- a UI bridge is a remote-control surface for thClaws, not just a notification tool
+- any chat that reaches the bridge may cause tools to run on the host machine
+- group chats are higher risk than one-on-one chats
+- use explicit allowlists and least-privilege file roots
+- keep bot tokens out of git, screenshots, and issue comments
+
+Recommended path:
+
+1. Use this MCP server first as a notification and artifact-sending tool.
+2. Add reply-oriented tools only if real workflows need them.
+3. Build a Telegram UI bridge only after the session/auth/security model is clear.
 
 ## License
 
